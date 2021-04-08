@@ -31,16 +31,28 @@ class InvalidPluginError(commands.BadArgument):
 
 
 class Plugin:
-    def __init__(self, user, repo, name, branch=None):
-        self.user = user
-        self.repo = repo
-        self.name = name
-        self.branch = branch if branch is not None else "master"
-        self.url = f"https://github.com/{user}/{repo}/archive/{self.branch}.zip"
-        self.link = f"https://github.com/{user}/{repo}/tree/{self.branch}/{name}"
+    def __init__(self, user, repo=None, name=None, branch=None):
+        if repo is None:
+            self.user = "@local"
+            self.repo = "@local"
+            self.name = user
+            self.local = True
+            self.branch = "@local"
+            self.url = f"@local/{user}"
+            self.link = f"@local/{user}"
+        else:
+            self.user = user
+            self.repo = repo
+            self.name = name
+            self.local = False
+            self.branch = branch if branch is not None else "master"
+            self.url = f"https://github.com/{user}/{repo}/archive/{self.branch}.zip"
+            self.link = f"https://github.com/{user}/{repo}/tree/{self.branch}/{name}"
 
     @property
     def path(self):
+        if self.local:
+            return PurePath("plugins") / "@local" / self.name
         return PurePath("plugins") / self.user / self.repo / f"{self.name}-{self.branch}"
 
     @property
@@ -49,6 +61,8 @@ class Plugin:
 
     @property
     def cache_path(self):
+        if self.local:
+            raise ValueError("No cache path for local plugins!")
         return (
             Path(__file__).absolute().parent.parent
             / "temp"
@@ -58,9 +72,13 @@ class Plugin:
 
     @property
     def ext_string(self):
+        if self.local:
+            return f"plugins.@local.{self.name}.{self.name}"
         return f"plugins.{self.user}.{self.repo}.{self.name}-{self.branch}.{self.name}"
 
     def __str__(self):
+        if self.local:
+            return f"@local/{self.name}"
         return f"{self.user}/{self.repo}/{self.name}@{self.branch}"
 
     def __lt__(self, other):
@@ -68,10 +86,13 @@ class Plugin:
 
     @classmethod
     def from_string(cls, s, strict=False):
-        if not strict:
-            m = match(r"^(.+?)/(.+?)/(.+?)(?:@(.+?))?$", s)
-        else:
-            m = match(r"^(.+?)/(.+?)/(.+?)@(.+?)$", s)
+        m = match(r"^@?local/(.+)$", s)
+        if m is None:
+            if not strict:
+                m = match(r"^(.+?)/(.+?)/(.+?)(?:@(.+?))?$", s)
+            else:
+                m = match(r"^(.+?)/(.+?)/(.+?)@(.+?)$", s)
+
         if m is not None:
             return Plugin(*m.groups())
         raise InvalidPluginError("Cannot decipher %s.", s)  # pylint: disable=raising-format-tuple
@@ -145,12 +166,18 @@ class Plugins(commands.Cog):
                 continue
 
         logger.debug("Finished loading all plugins.")
+
+        self.bot.dispatch("plugins_ready")
+
         self._ready_event.set()
         await self.bot.config.update()
 
     async def download_plugin(self, plugin, force=False):
-        if plugin.abs_path.exists() and not force:
+        if plugin.abs_path.exists() and (not force or plugin.local):
             return
+
+        if plugin.local:
+            raise InvalidPluginError(f"Local plugin {plugin} not found!")
 
         plugin.abs_path.mkdir(parents=True, exist_ok=True)
 
@@ -166,12 +193,23 @@ class Plugins(commands.Cog):
             async with self.bot.session.get(plugin.url, headers=headers) as resp:
                 logger.debug("Downloading %s.", plugin.url)
                 raw = await resp.read()
-                plugin_io = io.BytesIO(raw)
-                if not plugin.cache_path.parent.exists():
-                    plugin.cache_path.parent.mkdir(parents=True)
 
-                with plugin.cache_path.open("wb") as f:
-                    f.write(raw)
+                try:
+                    raw = await resp.text()
+                except UnicodeDecodeError:
+                    pass
+                else:
+                    if raw == "Not Found":
+                        raise InvalidPluginError("Plugin not found")
+                    else:
+                        raise InvalidPluginError("Invalid download received, non-bytes object")
+
+            plugin_io = io.BytesIO(raw)
+            if not plugin.cache_path.parent.exists():
+                plugin.cache_path.parent.mkdir(parents=True)
+
+            with plugin.cache_path.open("wb") as f:
+                f.write(raw)
 
         with zipfile.ZipFile(plugin_io) as zipf:
             for info in zipf.infolist():
@@ -234,6 +272,14 @@ class Plugins(commands.Cog):
 
     async def parse_user_input(self, ctx, plugin_name, check_version=False):
 
+        if not self.bot.config["enable_plugins"]:
+            embed = discord.Embed(
+                description="Plugins are disabled, enable them by setting `ENABLE_PLUGINS=true`",
+                color=self.bot.main_color,
+            )
+            await ctx.send(embed=embed)
+            return
+
         if not self._ready_event.is_set():
             embed = discord.Embed(
                 description="Plugins are still loading, please try again later.",
@@ -268,7 +314,7 @@ class Plugins(commands.Cog):
                 embed = discord.Embed(
                     description="Invalid plugin name, double check the plugin name "
                     "or use one of the following formats: "
-                    "username/repo/plugin, username/repo/plugin@branch.",
+                    "username/repo/plugin-name, username/repo/plugin-name@branch, local/plugin-name.",
                     color=self.bot.error_color,
                 )
                 await ctx.send(embed=embed)
@@ -292,7 +338,8 @@ class Plugins(commands.Cog):
         Install a new plugin for the bot.
 
         `plugin_name` can be the name of the plugin found in `{prefix}plugin registry`,
-        or a direct reference to a GitHub hosted plugin (in the format `user/repo/name[@branch]`).
+        or a direct reference to a GitHub hosted plugin (in the format `user/repo/name[@branch]`)
+        or `local/name` for local plugins.
         """
 
         plugin = await self.parse_user_input(ctx, plugin_name, check_version=True)
@@ -313,19 +360,25 @@ class Plugins(commands.Cog):
             )
             return await ctx.send(embed=embed)
 
-        embed = discord.Embed(
-            description=f"Starting to download plugin from {plugin.link}...",
-            color=self.bot.main_color,
-        )
+        if plugin.local:
+            embed = discord.Embed(
+                description=f"Starting to load local plugin from {plugin.link}...",
+                color=self.bot.main_color,
+            )
+        else:
+            embed = discord.Embed(
+                description=f"Starting to download plugin from {plugin.link}...",
+                color=self.bot.main_color,
+            )
         msg = await ctx.send(embed=embed)
 
         try:
             await self.download_plugin(plugin, force=True)
-        except Exception:
+        except Exception as e:
             logger.warning("Unable to download plugin %s.", plugin, exc_info=True)
 
             embed = discord.Embed(
-                description="Failed to download plugin, check logs for error.",
+                description=f"Failed to download plugin, check logs for error.\n{type(e)}: {e}",
                 color=self.bot.error_color,
             )
 
@@ -340,11 +393,11 @@ class Plugins(commands.Cog):
 
             try:
                 await self.load_plugin(plugin)
-            except Exception:
+            except Exception as e:
                 logger.warning("Unable to load plugin %s.", plugin, exc_info=True)
 
                 embed = discord.Embed(
-                    description="Failed to download plugin, check logs for error.",
+                    description=f"Failed to download plugin, check logs for error.\n{type(e)}: {e}",
                     color=self.bot.error_color,
                 )
 
@@ -373,7 +426,7 @@ class Plugins(commands.Cog):
         Remove an installed plugin of the bot.
 
         `plugin_name` can be the name of the plugin found in `{prefix}plugin registry`, or a direct reference
-        to a GitHub hosted plugin (in the format `user/repo/name[@branch]`).
+        to a GitHub hosted plugin (in the format `user/repo/name[@branch]`) or `local/name` for local plugins.
         """
         plugin = await self.parse_user_input(ctx, plugin_name)
         if plugin is None:
@@ -394,17 +447,18 @@ class Plugins(commands.Cog):
 
         self.bot.config["plugins"].remove(str(plugin))
         await self.bot.config.update()
-        shutil.rmtree(
-            plugin.abs_path,
-            onerror=lambda *args: logger.warning(
-                "Failed to remove plugin files %s: %s", plugin, str(args[2])
-            ),
-        )
-        try:
-            plugin.abs_path.parent.rmdir()
-            plugin.abs_path.parent.parent.rmdir()
-        except OSError:
-            pass  # dir not empty
+        if not plugin.local:
+            shutil.rmtree(
+                plugin.abs_path,
+                onerror=lambda *args: logger.warning(
+                    "Failed to remove plugin files %s: %s", plugin, str(args[2])
+                ),
+            )
+            try:
+                plugin.abs_path.parent.rmdir()
+                plugin.abs_path.parent.parent.rmdir()
+            except OSError:
+                pass  # dir not empty
 
         embed = discord.Embed(
             description="The plugin is successfully uninstalled.", color=self.bot.main_color
@@ -455,7 +509,7 @@ class Plugins(commands.Cog):
         Update a plugin for the bot.
 
         `plugin_name` can be the name of the plugin found in `{prefix}plugin registry`, or a direct reference
-        to a GitHub hosted plugin (in the format `user/repo/name[@branch]`).
+        to a GitHub hosted plugin (in the format `user/repo/name[@branch]`) or `local/name` for local plugins.
 
         To update all plugins, do `{prefix}plugins update`.
         """
@@ -492,7 +546,7 @@ class Plugins(commands.Cog):
             shutil.rmtree(cache_path)
 
         for entry in os.scandir(Path(__file__).absolute().parent.parent / "plugins"):
-            if entry.is_dir():
+            if entry.is_dir() and entry.name != "@local":
                 shutil.rmtree(entry.path)
                 logger.warning("Removing %s.", entry.name)
 
